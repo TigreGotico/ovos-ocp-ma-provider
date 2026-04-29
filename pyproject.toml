@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovos-ocp-ma-provider"
+version = "0.1.0"
+description = "OVOS OCP skills as a Music Assistant music provider"
+requires-python = ">=3.11"
+dependencies = [
+    "music-assistant-plugin-manager",
+    "ovos-bus-client",
+    "ovos-utils",
+    "ovos-pydantic-models",
+]
+
+[project.entry-points."music_assistant.provider"]
+ovos_ocp = "ovos_ocp_ma_provider"
+
+[tool.setuptools.packages.find]
+include = ["ovos_ocp_ma_provider*"]
+
+[tool.setuptools.package-data]
+ovos_ocp_ma_provider = ["manifest.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio", "ovos-pydantic-models"]

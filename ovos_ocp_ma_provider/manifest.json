@@ -1,0 +1,11 @@
+{
+  "type": "music",
+  "domain": "ovos_ocp",
+  "name": "OpenVoiceOS OCP Skills",
+  "description": "Search OVOS OCP skills for media and stream results through Music Assistant.",
+  "codeowners": ["@TigreGotico"],
+  "stage": "beta",
+  "requirements": ["ovos-bus-client", "ovos-utils", "ovos-pydantic-models"],
+  "documentation": "https://github.com/TigreGotico/ovos-ocp-ma-provider",
+  "multi_instance": false
+}
