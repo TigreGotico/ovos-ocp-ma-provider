@@ -11,19 +11,27 @@ bridge between MA's search API and OCP's bus-based query/response protocol.
 
 One MA search → one OCP query broadcast → N skill responses → MA tracks.
 
-Stream URI lookup: OCP URIs are stored in an in-memory cache keyed by
-item_id (a stable hash of instance_id + URI). The cache is populated during
-search and consulted during get_stream_details. It is bounded to avoid
-unbounded growth; older entries are evicted via an ordered dict (LRU style).
+OCP has no library of its own: a track only exists for as long as some
+search result names it. To survive MA restarts (MA persists library/queue
+entries across the process lifetime and re-resolves them by prov_track_id
+on demand) every track a search returns is also written to a small JSON
+file under the provider's storage directory, keyed by item_id. On startup
+that file is read back to warm the in-memory caches, so get_track() and
+get_stream_details() keep working for tracks found in a previous run
+without requiring a fresh search. The store is bounded (oldest entries
+evicted first) to avoid unbounded growth.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import tempfile
 import threading
 from collections import OrderedDict
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from music_assistant_models.media_items import AudioFormat, SearchResults
@@ -37,7 +45,6 @@ from music_assistant_models.enums import (
     StreamType,
 )
 from music_assistant_models.media_items import (
-    Artist,
     ItemMapping,
     MediaItemImage,
     MediaItemMetadata,
@@ -68,9 +75,10 @@ CONF_MIN_CONFIDENCE = "min_confidence"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8181
 DEFAULT_OCP_TIMEOUT = 10
-DEFAULT_MIN_CONFIDENCE = 0.5  # MatchConfidence.AVERAGE
+DEFAULT_MIN_CONFIDENCE = 50  # MatchConfidence.AVERAGE — OCP scores are 0-100, not 0.0-1.0
 
-_URI_CACHE_MAX = 2000  # max item_id → URI entries kept in memory
+_TRACK_CACHE_MAX = 2000  # max item_id → track entries kept (memory and on disk)
+_STORE_FILENAME = "ocp_tracks.json"
 
 
 async def setup(
@@ -84,40 +92,22 @@ def _stable_id(*parts: str) -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
-def _ocp_entry_to_track(
-    entry: dict,
+def _build_track(
+    item_id: str,
+    uri: str,
+    title: str,
+    artist_name: str,
+    duration_s: int,
+    image_url: str | None,
     provider_instance_id: str,
     provider_domain: str,
-    uri_cache: OrderedDict,
-) -> Track | None:
-    """Convert a single OCP MediaEntry dict to an MA Track.
+) -> Track:
+    """Build an MA Track from already-normalized fields.
 
-    Returns None for entries without a URI or with non-audio playback type.
-    The stream URI is inserted into uri_cache[item_id] so get_stream_details
-    can resolve it later without re-querying OCP.
+    Shared by the OCP search-result path and the on-disk store loader so
+    both produce identical Track objects for the same item_id.
     """
-    uri = entry.get("uri", "")
-    if not uri:
-        return None
-
-    # OCP playback types: "audio", "video", "webview", "skill"
-    playback = str(entry.get("playback", "audio")).lower()
-    if playback in ("video", "webview"):
-        return None
-
-    title = entry.get("title") or uri
-    artist_name = entry.get("artist") or entry.get("skill_id") or "Unknown"
-    duration_ms = entry.get("length") or 0
-    duration_s = int(duration_ms // 1000) if duration_ms else 0
-    image_url = entry.get("image") or entry.get("bg_image")
-
-    item_id = _stable_id(provider_instance_id, uri)
     artist_id = _stable_id(provider_instance_id, "artist", artist_name)
-
-    # Cache URI before building Track so get_stream_details can find it
-    uri_cache[item_id] = uri
-    if len(uri_cache) > _URI_CACHE_MAX:
-        uri_cache.popitem(last=False)  # evict oldest
 
     metadata = MediaItemMetadata()
     if image_url:
@@ -142,7 +132,7 @@ def _ocp_entry_to_track(
                 provider_instance=provider_instance_id,
                 audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 available=True,
-                details=uri,  # secondary storage; primary is uri_cache
+                details=uri,  # the playable OCP uri
             )
         },
         artists=[
@@ -157,12 +147,42 @@ def _ocp_entry_to_track(
     )
 
 
+def _ocp_entry_to_track(
+    entry: dict,
+    provider_instance_id: str,
+    provider_domain: str,
+) -> Track | None:
+    """Convert a single OCP MediaEntry dict to an MA Track.
+
+    Returns None for entries without a URI or with non-audio playback type.
+    """
+    uri = entry.get("uri", "")
+    if not uri:
+        return None
+
+    # OCP playback types: "audio", "video", "webview", "skill"
+    playback = str(entry.get("playback", "audio")).lower()
+    if playback in ("video", "webview"):
+        return None
+
+    title = entry.get("title") or uri
+    artist_name = entry.get("artist") or entry.get("skill_id") or "Unknown"
+    duration_ms = entry.get("length") or 0
+    duration_s = int(duration_ms // 1000) if duration_ms else 0
+    image_url = entry.get("image") or entry.get("bg_image")
+
+    item_id = _stable_id(provider_instance_id, uri)
+    return _build_track(
+        item_id, uri, title, artist_name, duration_s, image_url,
+        provider_instance_id, provider_domain,
+    )
+
+
 def _collect_tracks(
     raw_results: list[dict],
     provider_instance_id: str,
     provider_domain: str,
     min_confidence: float,
-    uri_cache: OrderedDict,
 ) -> list[Track]:
     """Flatten all OCP skill result dicts to a deduplicated list of MA Tracks."""
     seen_uris: set[str] = set()
@@ -185,11 +205,49 @@ def _collect_tracks(
             if not uri or uri in seen_uris:
                 continue
             seen_uris.add(uri)
-            track = _ocp_entry_to_track(entry, provider_instance_id, provider_domain, uri_cache)
+            track = _ocp_entry_to_track(entry, provider_instance_id, provider_domain)
             if track:
                 tracks.append(track)
 
     return tracks
+
+
+def _track_to_store_entry(track: Track) -> dict | None:
+    """Reduce a Track to the plain-dict shape written to the on-disk store."""
+    mapping = next(iter(track.provider_mappings), None)
+    uri = mapping.details if mapping else None
+    if not uri:
+        return None
+    image = None
+    if track.metadata and track.metadata.images:
+        image = track.metadata.images[0].path
+    artist = track.artists[0] if track.artists else None
+    return {
+        "uri": uri,
+        "title": track.name,
+        "duration": track.duration or 0,
+        "image": image,
+        "artist_name": artist.name if artist else "Unknown",
+    }
+
+
+def _store_entry_to_track(
+    item_id: str, entry: dict, provider_instance_id: str, provider_domain: str
+) -> Track | None:
+    """Rebuild a Track from a stored on-disk entry."""
+    uri = entry.get("uri")
+    if not uri:
+        return None
+    return _build_track(
+        item_id,
+        uri,
+        entry.get("title") or uri,
+        entry.get("artist_name") or "Unknown",
+        int(entry.get("duration") or 0),
+        entry.get("image"),
+        provider_instance_id,
+        provider_domain,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -230,18 +288,63 @@ class OVOSOCPProvider(MusicProvider):
             ConfigEntry(
                 key=CONF_MIN_CONFIDENCE,
                 type=ConfigEntryType.FLOAT,
-                label="Minimum match confidence (0.0–1.0)",
+                label="Minimum match confidence (0-100)",
                 required=False,
                 default_value=DEFAULT_MIN_CONFIDENCE,
-                description="OCP results below this score are discarded.",
+                description=(
+                    "OCP results below this score are discarded. Matches OCP's own "
+                    "0-100 match_confidence scale (50 = MatchConfidence.AVERAGE)."
+                ),
             ),
         )
 
+    # ---------------------------------------------------------------------------
+    # On-disk track store (restart survival)
+    # ---------------------------------------------------------------------------
+
+    def _resolve_store_path(self) -> Path:
+        """Where the per-instance track store lives.
+
+        MA hands every provider a persistent storage_path on the running
+        MusicAssistant instance; fall back to a tempdir so the provider is
+        still importable/testable outside a live MA process.
+        """
+        base = Path(getattr(self.mass, "storage_path", None) or tempfile.gettempdir())
+        store_dir = base / "providers" / self.instance_id
+        store_dir.mkdir(parents=True, exist_ok=True)
+        return store_dir / _STORE_FILENAME
+
+    def _load_store(self) -> None:
+        """Warm the in-memory track cache from the on-disk store, if present."""
+        if not self._store_path.exists():
+            return
+        try:
+            raw = json.loads(self._store_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as err:
+            self.logger.warning("Could not read OCP track store %s: %s", self._store_path, err)
+            return
+        for item_id, entry in raw.items():
+            track = _store_entry_to_track(item_id, entry, self.instance_id, self.domain)
+            if track:
+                self._track_cache[item_id] = track
+
+    def _persist_store(self) -> None:
+        """Write the current track cache to disk, keyed by item_id."""
+        entries = {}
+        for item_id, track in self._track_cache.items():
+            entry = _track_to_store_entry(track)
+            if entry:
+                entries[item_id] = entry
+        try:
+            tmp_path = self._store_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(entries), encoding="utf-8")
+            tmp_path.replace(self._store_path)
+        except OSError as err:
+            self.logger.warning("Could not persist OCP track store %s: %s", self._store_path, err)
 
     # ---------------------------------------------------------------------------
-    # Helpers
+    # Lifecycle
     # ---------------------------------------------------------------------------
-
 
     async def handle_async_init(self) -> None:
         try:
@@ -279,9 +382,10 @@ class OVOSOCPProvider(MusicProvider):
             "early_stop_thresh": 90,
             "early_stop_grace_period": 0.5,
         }
-        # item_id → stream URI; bounded LRU-style ordered dict
-        self._uri_cache: OrderedDict[str, str] = OrderedDict()
+
         self._track_cache: OrderedDict[str, Track] = OrderedDict()
+        self._store_path = self._resolve_store_path()
+        self._load_store()
 
     # ------------------------------------------------------------------
     # Internal: synchronous OCP search (called via asyncio.to_thread)
@@ -328,14 +432,12 @@ class OVOSOCPProvider(MusicProvider):
 
         raw = await asyncio.to_thread(self._run_ocp_query, search_query, ocp_media_type)
 
-        tracks = _collect_tracks(
-            raw, self.instance_id, self.domain,
-            self._min_confidence, self._uri_cache,
-        )
+        tracks = _collect_tracks(raw, self.instance_id, self.domain, self._min_confidence)
         for track in tracks:
             self._track_cache[track.item_id] = track
-        while len(self._track_cache) > _URI_CACHE_MAX:
+        while len(self._track_cache) > _TRACK_CACHE_MAX:
             self._track_cache.popitem(last=False)
+        self._persist_store()
         self.logger.debug(
             "OCP search %r: %d skills, %d tracks after filtering",
             search_query, len(raw), len(tracks),
@@ -343,16 +445,18 @@ class OVOSOCPProvider(MusicProvider):
         return SearchResults(tracks=tracks[:limit])
 
     async def get_track(self, prov_track_id: str) -> Track:
-        """Return a track from the search cache.
+        """Return a track by id.
 
-        OCP has no library to look an id up in: a result only exists for as
-        long as the search that produced it is cached.
+        OCP has no library of its own: an id only resolves if some earlier
+        search produced it. The in-memory cache is warmed from the on-disk
+        store on startup, so this also resolves tracks found before an MA
+        restart, as long as the store still holds that entry.
         """
         track = self._track_cache.get(prov_track_id)
         if track is None:
             from music_assistant_models.errors import MediaNotFoundError
             raise MediaNotFoundError(
-                f"Track {prov_track_id!r} is not in the OCP search cache — "
+                f"Track {prov_track_id!r} is not in the OCP track store — "
                 "search for it again to refresh."
             )
         self._track_cache.move_to_end(prov_track_id)
@@ -361,20 +465,21 @@ class OVOSOCPProvider(MusicProvider):
     async def get_stream_details(
         self, item_id: str, media_type: MediaType = MediaType.TRACK
     ) -> StreamDetails:
-        """Return stream details for a track using the cached OCP URI.
+        """Return stream details for a track using its stored OCP uri.
 
-        :param item_id: ProviderMapping.item_id — stable hash of instance_id + URI.
+        :param item_id: ProviderMapping.item_id — stable hash of instance_id + uri.
         :param media_type: MA media type of the item.
         """
-        uri = self._uri_cache.get(item_id)
-        if not uri:
+        track = self._track_cache.get(item_id)
+        if track is None:
             from music_assistant_models.errors import MediaNotFoundError
             raise MediaNotFoundError(
-                f"Stream URI for {item_id!r} not in cache — "
+                f"Stream URI for {item_id!r} not in the OCP track store — "
                 "search for this track again to refresh."
             )
-        # Move to end (most-recently-used)
-        self._uri_cache.move_to_end(item_id)
+        mapping = next(iter(track.provider_mappings))
+        uri = mapping.details
+        self._track_cache.move_to_end(item_id)
         return StreamDetails(
             provider=self.domain,
             item_id=item_id,
@@ -386,6 +491,42 @@ class OVOSOCPProvider(MusicProvider):
             allow_seek=True,
         )
 
+    async def get_library_tracks(self):
+        """OCP is search-only and has no browsable library."""
+        from music_assistant_models.errors import UnsupportedFeaturedException
+        raise UnsupportedFeaturedException(
+            f"{self.domain} has no library — search-only provider")
+        yield  # pragma: no cover - makes this an async generator
+
+    async def get_artist(self, prov_artist_id: str):
+        """Artists are not independently resolvable; they only exist as track fields."""
+        from music_assistant_models.errors import UnsupportedFeaturedException
+        raise UnsupportedFeaturedException(
+            f"{self.domain} does not support artist lookups")
+
+    async def get_album(self, prov_album_id: str):
+        """OCP has no concept of albums."""
+        from music_assistant_models.errors import UnsupportedFeaturedException
+        raise UnsupportedFeaturedException(
+            f"{self.domain} does not support album lookups")
+
+    async def get_playlist(self, prov_playlist_id: str):
+        """OCP has no concept of playlists."""
+        from music_assistant_models.errors import UnsupportedFeaturedException
+        raise UnsupportedFeaturedException(
+            f"{self.domain} does not support playlist lookups")
+
+    async def get_radio(self, prov_radio_id: str):
+        """Radio stations returned by search are tracks; there is no separate radio store."""
+        from music_assistant_models.errors import UnsupportedFeaturedException
+        raise UnsupportedFeaturedException(
+            f"{self.domain} does not support radio lookups")
+
     async def unload(self, is_removed: bool = False) -> None:
         if getattr(self, "bus", None):
             self.bus.close()
+        if is_removed and getattr(self, "_store_path", None) and self._store_path.exists():
+            try:
+                self._store_path.unlink()
+            except OSError:
+                pass
