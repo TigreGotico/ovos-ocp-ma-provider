@@ -26,8 +26,8 @@ import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
-from music_assistant_models.audio_format import AudioFormat
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+from music_assistant_models.media_items import AudioFormat, SearchResults
+from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
@@ -78,54 +78,6 @@ async def setup(
 ) -> ProviderInstanceType:
     return OVOSOCPProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
-
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    return (
-        ConfigEntry(
-            key=CONF_HOST,
-            type=ConfigEntryType.STRING,
-            label="OVOS messagebus host",
-            required=False,
-            default_value=DEFAULT_HOST,
-            description="Hostname or IP of the OVOS messagebus (must be reachable from MA).",
-        ),
-        ConfigEntry(
-            key=CONF_PORT,
-            type=ConfigEntryType.INTEGER,
-            label="OVOS messagebus port",
-            required=False,
-            default_value=DEFAULT_PORT,
-        ),
-        ConfigEntry(
-            key=CONF_OCP_TIMEOUT,
-            type=ConfigEntryType.INTEGER,
-            label="OCP search timeout (seconds)",
-            required=False,
-            default_value=DEFAULT_OCP_TIMEOUT,
-            description=(
-                "How long to wait for OCP skills to respond. "
-                "Skills may extend this via the OCP protocol."
-            ),
-        ),
-        ConfigEntry(
-            key=CONF_MIN_CONFIDENCE,
-            type=ConfigEntryType.FLOAT,
-            label="Minimum match confidence (0.0–1.0)",
-            required=False,
-            default_value=DEFAULT_MIN_CONFIDENCE,
-            description="OCP results below this score are discarded.",
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _stable_id(*parts: str) -> str:
     """Deterministic 16-char item_id from variable string parts."""
@@ -247,6 +199,50 @@ def _collect_tracks(
 class OVOSOCPProvider(MusicProvider):
     """Music provider that queries OVOS OCP skills for media via the messagebus."""
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        return (
+            ConfigEntry(
+                key=CONF_HOST,
+                type=ConfigEntryType.STRING,
+                label="OVOS messagebus host",
+                required=False,
+                default_value=DEFAULT_HOST,
+                description="Hostname or IP of the OVOS messagebus (must be reachable from MA).",
+            ),
+            ConfigEntry(
+                key=CONF_PORT,
+                type=ConfigEntryType.INTEGER,
+                label="OVOS messagebus port",
+                required=False,
+                default_value=DEFAULT_PORT,
+            ),
+            ConfigEntry(
+                key=CONF_OCP_TIMEOUT,
+                type=ConfigEntryType.INTEGER,
+                label="OCP search timeout (seconds)",
+                required=False,
+                default_value=DEFAULT_OCP_TIMEOUT,
+                description=(
+                    "How long to wait for OCP skills to respond. "
+                    "Skills may extend this via the OCP protocol."
+                ),
+            ),
+            ConfigEntry(
+                key=CONF_MIN_CONFIDENCE,
+                type=ConfigEntryType.FLOAT,
+                label="Minimum match confidence (0.0–1.0)",
+                required=False,
+                default_value=DEFAULT_MIN_CONFIDENCE,
+                description="OCP results below this score are discarded.",
+            ),
+        )
+
+
+    # ---------------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------------
+
+
     async def handle_async_init(self) -> None:
         try:
             from ovos_bus_client import MessageBusClient, Message  # noqa: PLC0415
@@ -285,6 +281,7 @@ class OVOSOCPProvider(MusicProvider):
         }
         # item_id → stream URI; bounded LRU-style ordered dict
         self._uri_cache: OrderedDict[str, str] = OrderedDict()
+        self._track_cache: OrderedDict[str, Track] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Internal: synchronous OCP search (called via asyncio.to_thread)
@@ -311,7 +308,7 @@ class OVOSOCPProvider(MusicProvider):
         search_query: str,
         media_types: list[MediaType] | None = None,
         limit: int = 25,
-    ) -> list[Track | Artist]:
+    ) -> SearchResults:
         """Search OCP skills and return results as MA Tracks."""
         from ovos_utils.ocp import MediaType as OcpMediaType  # noqa: PLC0415
 
@@ -335,14 +332,31 @@ class OVOSOCPProvider(MusicProvider):
             raw, self.instance_id, self.domain,
             self._min_confidence, self._uri_cache,
         )
+        for track in tracks:
+            self._track_cache[track.item_id] = track
+        while len(self._track_cache) > _URI_CACHE_MAX:
+            self._track_cache.popitem(last=False)
         self.logger.debug(
             "OCP search %r: %d skills, %d tracks after filtering",
             search_query, len(raw), len(tracks),
         )
-        return tracks[:limit]
+        return SearchResults(tracks=tracks[:limit])
 
     async def get_track(self, prov_track_id: str) -> Track:
-        raise NotImplementedError
+        """Return a track from the search cache.
+
+        OCP has no library to look an id up in: a result only exists for as
+        long as the search that produced it is cached.
+        """
+        track = self._track_cache.get(prov_track_id)
+        if track is None:
+            from music_assistant_models.errors import MediaNotFoundError
+            raise MediaNotFoundError(
+                f"Track {prov_track_id!r} is not in the OCP search cache — "
+                "search for it again to refresh."
+            )
+        self._track_cache.move_to_end(prov_track_id)
+        return track
 
     async def get_stream_details(
         self, item_id: str, media_type: MediaType = MediaType.TRACK
@@ -372,6 +386,6 @@ class OVOSOCPProvider(MusicProvider):
             allow_seek=True,
         )
 
-    async def unload(self) -> None:
-        if hasattr(self, "bus"):
+    async def unload(self, is_removed: bool = False) -> None:
+        if getattr(self, "bus", None):
             self.bus.close()

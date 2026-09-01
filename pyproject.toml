@@ -9,9 +9,9 @@ description = "OVOS OCP skills as a Music Assistant music provider"
 requires-python = ">=3.11"
 dependencies = [
     "music-assistant-plugin-manager",
-    "ovos-bus-client",
-    "ovos-utils",
-    "ovos-pydantic-models",
+    "ovos-bus-client>=2.9.1a1",
+    "ovos-utils>=0.8.5",
+    "ovos-pydantic-models>=0.2.2a1",
 ]
 
 [project.entry-points."music_assistant.provider"]
