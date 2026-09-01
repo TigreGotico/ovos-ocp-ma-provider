@@ -8,10 +8,10 @@ version = "0.1.0"
 description = "OVOS OCP skills as a Music Assistant music provider"
 requires-python = ">=3.11"
 dependencies = [
-    "music-assistant-plugin-manager",
     "ovos-bus-client>=2.9.1a1",
     "ovos-utils>=0.8.5",
     "ovos-pydantic-models>=0.2.2a1",
+    "music-assistant-models>=1.1.206",
 ]
 
 [project.entry-points."music_assistant.provider"]
@@ -28,4 +28,4 @@ testpaths = ["tests"]
 asyncio_mode = "strict"
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-asyncio", "ovos-pydantic-models"]
+test = ["pytest", "pytest-asyncio"]
