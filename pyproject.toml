@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovos-ocp-ma-provider"
-version = "0.1.0"
+dynamic = ["version"]
 description = "OVOS OCP skills as a Music Assistant music provider"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "ovos-bus-client>=2.9.1a1",
     "ovos-utils>=0.8.5",
@@ -16,6 +16,9 @@ dependencies = [
 
 [project.entry-points."music_assistant.provider"]
 ovos_ocp = "ovos_ocp_ma_provider"
+
+[tool.setuptools.dynamic]
+version = { attr = "ovos_ocp_ma_provider.version.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["ovos_ocp_ma_provider*"]
