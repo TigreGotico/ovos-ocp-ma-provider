@@ -1,0 +1,14 @@
+name: Run Build Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build_tests:
+    uses: OpenVoiceOS/gh-automations/.github/workflows/build-tests.yml@dev
+    with:
+      python_versions: '["3.12", "3.13", "3.14"]'
+      install_extras: "test"
+      test_path: "tests/"
+    secrets: inherit

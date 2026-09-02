@@ -1,0 +1,14 @@
+name: Coverage Report
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@dev
+    with:
+      python_version: "3.12"
+      test_path: "tests/"
+      test_extras: "test"
+    secrets: inherit
