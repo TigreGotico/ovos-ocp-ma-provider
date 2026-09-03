@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.1a2](https://github.com/TigreGotico/ovos-ocp-ma-provider/tree/0.1.1a2) (2026-09-02)
+
+[Full Changelog](https://github.com/TigreGotico/ovos-ocp-ma-provider/compare/0.1.1a1...0.1.1a2)
+
 ## [0.1.1a1](https://github.com/TigreGotico/ovos-ocp-ma-provider/tree/0.1.1a1) (2026-09-02)
 
 [Full Changelog](https://github.com/TigreGotico/ovos-ocp-ma-provider/compare/74cf9a4e7caad2412617b3d75c0f0db78081540e...0.1.1a1)
